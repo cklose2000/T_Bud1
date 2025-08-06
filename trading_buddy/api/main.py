@@ -49,6 +49,10 @@ app.include_router(council.router, prefix="/council", tags=["Council"])
 app.include_router(signal.router, prefix="/signal", tags=["Signal"])
 app.include_router(agent.router, prefix="/agent", tags=["Agent"])
 
+# Import and include agentic router
+from trading_buddy.api.routes import agentic
+app.include_router(agentic.router, prefix="/agentic", tags=["Agentic"])
+
 
 @app.get("/")
 async def root():

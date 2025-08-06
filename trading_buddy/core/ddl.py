@@ -14,6 +14,7 @@ def create_events_table(conn: DuckDBPyConnection):
             fwd_ret DOUBLE,
             max_dd DOUBLE,
             label TEXT,
+            oos_split TEXT DEFAULT 'train',  -- 'train', 'test', or 'live'
             PRIMARY KEY (symbol, timeframe, event_ts, pattern)
         )
     """)
@@ -77,9 +78,27 @@ def create_indices(conn: DuckDBPyConnection):
     """)
 
 
+def create_reports_daily_table(conn: DuckDBPyConnection):
+    """Create reports_daily table for storing compressed daily snapshots."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS reports_daily (
+            symbol TEXT,
+            as_of DATE,
+            summary_md TEXT,
+            top_edges_json JSON,
+            drift_json JSON,
+            council_ci_json JSON,
+            examples_json JSON,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (symbol, as_of)
+        )
+    """)
+
+
 def initialize_database(conn: DuckDBPyConnection):
     """Initialize all database tables and indices."""
     create_events_table(conn)
     create_contexts_table(conn)
     create_consistency_matrix_table(conn)
+    create_reports_daily_table(conn)
     create_indices(conn)
