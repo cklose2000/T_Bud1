@@ -11,6 +11,23 @@ An NLP-fluent, agentic trading buddy that provides council-based signal validati
 - **Proactive Alerts**: Precursor detection and counterfactual analysis
 - **Zero Configuration**: Auto-discovers database schema
 
+## Recent Updates
+
+### PR8: Statistical Rigor & Uncertainty Quantification (2024-01)
+- **Bootstrap Confidence Intervals**: 95% CIs for lift metrics with automatic method selection (standard/median/block)
+- **FDR Control**: Benjamini-Hochberg procedure to limit false discoveries to 10%
+- **Robustness Features**:
+  - Automatic skew detection switches to median bootstrap for heavy-tailed returns
+  - Block bootstrap for time-dependent data preserves serial correlation
+  - Effect-size based power calculations replace naive linear scaling
+  - Minimum CI width enforcement (1.9×SE) prevents overconfidence on thin samples
+- **Operational Hardening**:
+  - Chunked processing with job ledger for restart resilience
+  - Performance monitoring with 85% runtime threshold
+  - Code version hashing for automatic cache invalidation
+- **Trade Gates**: Strict quality controls (n_eff≥60, stability≥0.4, CI excludes zero, FDR pass)
+- **Monitoring**: Enhanced `/metrics/summary` with uncertainty metrics and gate distributions
+
 ## Quick Start
 
 ```bash

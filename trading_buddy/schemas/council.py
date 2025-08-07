@@ -11,11 +11,15 @@ class TradingPlan(BaseModel):
 
 
 class CIBreakdown(BaseModel):
-    timeframe: str
-    pattern: str
+    context_tf: str  # Renamed for clarity
+    context_name: str  # Renamed for clarity
     ci: float
     present: bool
-    exp_lift: Optional[float] = None
+    n: int = 0  # Sample size
+    exp_lift: float = 0.0
+    hit_rate: float = 0.5
+    stability: float = 0.0
+    metadata: Optional[Dict] = None  # For CI v2 additional info
 
 
 class CouncilResponse(BaseModel):
@@ -29,3 +33,4 @@ class CouncilResponse(BaseModel):
     plan: TradingPlan
     counterfactuals: Optional[Dict[str, float]] = None
     follow_ups: List[str] = Field(default_factory=list)
+    metadata: Optional[Dict] = None  # For CI version tracking, request ID, etc.

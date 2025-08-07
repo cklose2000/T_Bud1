@@ -4,6 +4,7 @@ from typing import Dict, List, Optional
 from duckdb import DuckDBPyConnection
 
 from trading_buddy.council.consistency import calculate_consistency_index
+from trading_buddy.council.ci_v2_integration import CIv2Integration
 from trading_buddy.core.config import settings
 # from trading_buddy.detectors.indicators import compute_atr
 from trading_buddy.detectors.outcomes import compute_pattern_stats
@@ -154,7 +155,7 @@ def council_vote(
     hypothesis: Hypothesis,
 ) -> CouncilResponse:
     """
-    Main council voting function.
+    Main council voting function with CI v2 integration.
     """
     # Get base pattern (assuming compound pattern for now)
     base_pattern = "double_bottom_macd_bull"
@@ -182,32 +183,67 @@ def council_vote(
             follow_ups=["Insufficient historical data for this pattern"],
         )
     
+    # Initialize CI v2 integration
+    ci_v2 = CIv2Integration(conn)
+    use_v2 = ci_v2.use_v2
+    
+    # Generate request ID for logging
+    import uuid
+    request_id = str(uuid.uuid4())
+    
     # Check current contexts and build CI breakdown
     event_ts = hypothesis.now_ts or datetime.now()
     ci_breakdown = []
     
-    for vote in hypothesis.cross_timeframe_votes:
-        for validator in vote.validators:
-            ctx_name = validator["name"]
-            
-            # Check if context is present
-            present = check_current_context(
-                conn, hypothesis.symbol, vote.tf, ctx_name, event_ts
-            )
-            
-            # Get CI metrics
-            metrics = get_consistency_metrics(
-                conn, base_tf, base_pattern, vote.tf, ctx_name
-            )
-            
-            if metrics:
-                ci_breakdown.append(CIBreakdown(
-                    timeframe=vote.tf,
-                    pattern=ctx_name,
-                    ci=metrics["ci"],
-                    present=present,
-                    exp_lift=metrics["exp_lift"] if present else None,
-                ))
+    if use_v2:
+        # Use CI v2 with uncertainty and clamping
+        contexts = []
+        for vote in hypothesis.cross_timeframe_votes:
+            for validator in vote.validators:
+                ctx_name = validator["name"]
+                ctx_tf = vote.tf
+                
+                # Check if context is present
+                present = check_current_context(
+                    conn, hypothesis.symbol, ctx_tf, ctx_name, event_ts
+                )
+                contexts.append((ctx_tf, ctx_name, present))
+        
+        # Get CI v2 breakdown with uncertainty
+        ci_breakdown = ci_v2.create_ci_breakdown_v2(
+            hypothesis.symbol, base_tf, base_pattern, contexts
+        )
+        
+        # Log decision for monitoring
+        ci_v2.log_v2_decision(request_id, hypothesis.symbol, base_pattern, ci_breakdown)
+        
+    else:
+        # Use legacy CI v1 (existing logic)
+        for vote in hypothesis.cross_timeframe_votes:
+            for validator in vote.validators:
+                ctx_name = validator["name"]
+                
+                # Check if context is present
+                present = check_current_context(
+                    conn, hypothesis.symbol, vote.tf, ctx_name, event_ts
+                )
+                
+                # Get CI metrics
+                metrics = get_consistency_metrics(
+                    conn, base_tf, base_pattern, vote.tf, ctx_name
+                )
+                
+                if metrics:
+                    ci_breakdown.append(CIBreakdown(
+                        context_tf=vote.tf,
+                        context_name=ctx_name,
+                        ci=metrics["ci"],
+                        present=present,
+                        n=metrics["n"],
+                        exp_lift=metrics["exp_lift"],
+                        hit_rate=metrics["hit_rate"],
+                        stability=metrics["stability"],
+                    ))
     
     # Calculate council score
     council_score = calculate_council_score(ci_breakdown)
@@ -242,6 +278,7 @@ def council_vote(
         ci_breakdown=ci_breakdown,
         plan=plan,
         follow_ups=[],
+        metadata={"ci_version": "v2" if use_v2 else "v1", "request_id": request_id}
     )
     
     # Add follow-up suggestions
@@ -250,6 +287,12 @@ def council_vote(
     
     if not any(item.present for item in ci_breakdown):
         response.follow_ups.append("No supporting contexts detected - higher risk setup")
+    
+    # Add CI v2 specific rejection reasons if applicable
+    if use_v2:
+        rejection_reason = ci_v2.format_rejection_reason(ci_breakdown)
+        if rejection_reason:
+            response.follow_ups.append(rejection_reason)
     
     return response
 

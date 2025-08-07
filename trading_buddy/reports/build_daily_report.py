@@ -8,6 +8,10 @@ from typing import Dict, List, Optional, Tuple
 import logging
 
 from duckdb import DuckDBPyConnection
+from trading_buddy.council.stability import (
+    calculate_rolling_stability,
+    check_pattern_drift
+)
 
 logger = logging.getLogger(__name__)
 
@@ -126,85 +130,82 @@ def detect_pattern_drift(
     as_of: date,
     window_days: int = 30
 ) -> Dict:
-    """Detect patterns that have decayed or show drift."""
-    query = """
-    WITH rolling_stats AS (
-        SELECT 
-            pattern,
-            timeframe,
-            event_ts,
-            fwd_ret,
-            AVG(fwd_ret) OVER (
-                PARTITION BY pattern, timeframe 
-                ORDER BY event_ts 
-                ROWS BETWEEN 20 PRECEDING AND CURRENT ROW
-            ) as rolling_mean,
-            STDDEV(fwd_ret) OVER (
-                PARTITION BY pattern, timeframe 
-                ORDER BY event_ts 
-                ROWS BETWEEN 20 PRECEDING AND CURRENT ROW
-            ) as rolling_std
-        FROM events
-        WHERE symbol = ?
-        AND event_ts >= ? - INTERVAL ? DAY
-        AND event_ts < ?
-    ),
-    drift_metrics AS (
-        SELECT 
-            pattern,
-            timeframe,
-            -- Recent vs historical performance
-            AVG(CASE WHEN event_ts >= DATE ? - INTERVAL 7 DAY THEN fwd_ret END) as recent_mean,
-            AVG(CASE WHEN event_ts < DATE ? - INTERVAL 7 DAY THEN fwd_ret END) as historical_mean,
-            -- Stability metric
-            COALESCE(STDDEV(rolling_mean), 0) as mean_stability,
-            COUNT(*) as n_events
-        FROM rolling_stats
-        GROUP BY pattern, timeframe
-    )
-    SELECT 
-        pattern,
-        timeframe,
-        recent_mean,
-        historical_mean,
-        (recent_mean - historical_mean) / NULLIF(ABS(historical_mean), 0) as drift_pct,
-        mean_stability,
-        n_events
-    FROM drift_metrics
-    WHERE ABS((recent_mean - historical_mean) / NULLIF(ABS(historical_mean), 0)) > 0.3
-    OR mean_stability > 0.02
-    ORDER BY ABS(drift_pct) DESC
+    """
+    Detect patterns that have decayed or show drift using stability module.
+    """
+    # Get patterns that exist for this symbol  
+    pattern_query = f"""
+    SELECT DISTINCT pattern, timeframe
+    FROM events
+    WHERE symbol = '{symbol}'
+    AND event_ts >= DATE '{as_of}' - INTERVAL {window_days} DAY
+    AND event_ts < DATE '{as_of}'
+    AND oos_split IN ('test', 'live')  -- Only OOS data
+    GROUP BY pattern, timeframe
+    HAVING COUNT(*) >= 10  -- Minimum for drift analysis
     """
     
-    # Format query with parameters, fixing date types
-    formatted_query = query.replace('DATE ?', "DATE '{}'").replace('?', '{}').format(
-        symbol, as_of, window_days, as_of, as_of, as_of
-    )
-    results = conn.execute(formatted_query).fetchall()
+    patterns = conn.execute(pattern_query).fetchall()
     
     drifted = []
     retired = []
+    stable = []
     
-    for r in results:
-        pattern_info = {
-            "pattern": r[0],
-            "timeframe": r[1],
-            "recent_mean": round(r[2], 4) if r[2] else 0,
-            "historical_mean": round(r[3], 4) if r[3] else 0,
-            "drift_pct": round(r[4], 2) if r[4] else 0,
-            "stability": round(r[5], 4) if r[5] else 0,
-            "n_events": r[6]
-        }
-        
-        # Classify as retired if performance has significantly degraded
-        if r[2] and r[3] and r[2] < 0 and r[3] > 0:
-            retired.append(pattern_info)
-        else:
-            drifted.append(pattern_info)
+    for pattern, timeframe in patterns:
+        try:
+            # Check drift using stability module
+            drift_info = check_pattern_drift(
+                conn, symbol, pattern, timeframe, alert_threshold=0.2
+            )
+            
+            # Get stability score
+            stability_info = calculate_rolling_stability(
+                conn, symbol, pattern, timeframe, window_days=window_days
+            )
+            
+            pattern_info = {
+                "pattern": pattern,
+                "timeframe": timeframe,
+                "recent_mean": drift_info["recent_mean"],
+                "historical_mean": drift_info["historical_mean"],
+                "performance_change": drift_info["performance_change"],
+                "psi": drift_info["psi"],
+                "stability_score": drift_info["stability_score"],
+                "is_drifting": drift_info["is_drifting"],
+                "recommendation": drift_info["recommendation"],
+                "n_recent": stability_info["n_recent"],
+                "n_historical": stability_info["n_historical"]
+            }
+            
+            # Classify patterns
+            if drift_info["is_drifting"]:
+                if drift_info["recent_mean"] < 0 and drift_info["historical_mean"] > 0:
+                    # Performance degraded significantly - retire
+                    retired.append(pattern_info)
+                else:
+                    # Just drifting - monitor
+                    drifted.append(pattern_info)
+            else:
+                stable.append(pattern_info)
+                
+        except Exception as e:
+            logger.warning(f"Failed to analyze drift for {symbol}:{pattern}:{timeframe}: {e}")
+            continue
+    
+    # Sort by severity (PSI for drifted, performance change for retired)
+    drifted.sort(key=lambda x: x["psi"], reverse=True)
+    retired.sort(key=lambda x: abs(x["performance_change"]), reverse=True)
     
     return {
         "drifted": drifted[:3],  # Top 3 drifted patterns
-        "retired": retired[:3]   # Top 3 retired patterns
+        "retired": retired[:3],  # Top 3 retired patterns
+        "stable": stable[:2],    # Include a few stable ones for reference
+        "total_patterns": len(patterns),
+        "drift_summary": {
+            "drifting": len(drifted),
+            "retired": len(retired), 
+            "stable": len(stable)
+        }
     }
 
 
@@ -364,16 +365,35 @@ def build_summary_markdown(
     
     lines.extend(["", "## Pattern Changes", ""])
     
-    # Drift warnings
-    if drift_data['retired']:
-        lines.append("**Retired Patterns:**")
-        for p in drift_data['retired']:
-            lines.append(f"- {p['pattern']} ({p['timeframe']}): {p['recent_mean']:.3f} vs {p['historical_mean']:.3f}")
+    # Drift summary first
+    if 'drift_summary' in drift_data:
+        summary = drift_data['drift_summary']
+        lines.append(f"**Status:** {summary['stable']} stable, {summary['drifting']} drifting, {summary['retired']} retired")
+        lines.append("")
     
-    if drift_data['drifted']:
-        lines.append("\n**Drifting Patterns:**")
+    # Retired patterns (highest priority)
+    if drift_data.get('retired'):
+        lines.append("**🚫 Retired Patterns (avoid):**")
+        for p in drift_data['retired']:
+            perf_change = p.get('performance_change', 0)
+            lines.append(f"- {p['pattern']} ({p['timeframe']}): {perf_change:+.3f} change (PSI: {p.get('psi', 0):.2f})")
+        lines.append("")
+    
+    # Drifting patterns (monitor closely)
+    if drift_data.get('drifted'):
+        lines.append("**⚠️ Drifting Patterns (monitor):**")
         for p in drift_data['drifted']:
-            lines.append(f"- {p['pattern']} ({p['timeframe']}): {p['drift_pct']:.0%} drift")
+            psi = p.get('psi', 0)
+            stability = p.get('stability_score', 0)
+            lines.append(f"- {p['pattern']} ({p['timeframe']}): PSI {psi:.2f}, stability {stability:.2f}")
+        lines.append("")
+    
+    # Stable patterns (for reference)
+    if drift_data.get('stable'):
+        lines.append("**✅ Stable Patterns:**")
+        for p in drift_data['stable'][:2]:  # Just show top 2
+            stability = p.get('stability_score', 0)
+            lines.append(f"- {p['pattern']} ({p['timeframe']}): stability {stability:.2f}")
     
     # Counterfactuals
     if counterfactuals:

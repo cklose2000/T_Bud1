@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 
 from trading_buddy.agents.llm.run_agent import run_agent, run_multi_agent_query
 from trading_buddy.core.duck import DuckDBManager
+from trading_buddy.middleware.referee_enhanced import EnhancedReferee
 from trading_buddy.reports.build_daily_report import build_daily_report
 from trading_buddy.reports.get_reports import get_report_summary
 
@@ -95,7 +96,8 @@ async def get_agent_report(
 @router.post("/agent/{symbol}/query")
 async def query_agent(
     symbol: str,
-    request: AgentQueryRequest
+    request: AgentQueryRequest,
+    referee_mode: bool = Query(False, description="Enable referee validation")
 ) -> AgentQueryResponse:
     """
     Query a ticker-specific agent.
@@ -109,6 +111,45 @@ async def query_agent(
             request.mode
         )
         
+        # Apply referee middleware if requested
+        if referee_mode:
+            with DuckDBManager() as db:
+                referee = EnhancedReferee(db.conn)
+                
+                final_answer = result.get("final_answer", "")
+                tool_results = result.get("tool_results", {})
+                
+                # Extract and verify numeric claims
+                message_id = f"agent_query_{hash(final_answer)}"
+                claims = referee.extract_numeric_claims(final_answer, message_id)
+                verified_claims = referee.verify_claims_against_tools(claims, tool_results, message_id)
+                
+                # Check for rejected claims
+                rejected_claims = [c for c in verified_claims if c.verdict == "rejected"]
+                
+                # Log final response
+                referee.log_final_response(message_id, "/agent/query", symbol.upper(), final_answer, verified_claims)
+                
+                if rejected_claims:
+                    raise HTTPException(
+                        status_code=422,
+                        detail={
+                            "message": "Agent response rejected by referee - unverified claims detected",
+                            "rejected_claims": [{"claim": c.claim_text, "value": c.value_numeric} for c in rejected_claims],
+                            "suggestion": "All numeric claims must be traceable to tool outputs"
+                        }
+                    )
+                
+                # Add validation to metadata
+                result["metadata"] = result.get("metadata", {})
+                result["metadata"]["referee_validation"] = {
+                    "total_claims": len(verified_claims),
+                    "verified_claims": len([c for c in verified_claims if c.verdict in ["verified", "corrected"]]),
+                    "rejected_claims": len(rejected_claims),
+                    "status": "approved" if not rejected_claims else "rejected"
+                }
+                result["verified"] = not rejected_claims
+        
         return AgentQueryResponse(
             symbol=symbol.upper(),
             query=request.query,
@@ -118,6 +159,8 @@ async def query_agent(
             metadata=result.get("metadata", {})
         )
         
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
